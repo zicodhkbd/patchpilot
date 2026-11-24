@@ -1,0 +1,107 @@
+name: PatchPilot CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT: patchpilot
+
+jobs:
+  # ---------------- CI: runs on every push and pull request ----------------
+  test:
+    name: Lint and unit test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install tools
+        run: pip install cfn-lint pytest flake8 boto3
+      - name: Lint CloudFormation templates
+        run: cfn-lint --ignore-checks W3002 -- infra/*.yaml
+      - name: Lint Python code
+        run: flake8 src tests --max-line-length 130
+      - name: Run unit tests
+        run: pytest -v tests
+
+  # ---------------- CD: only on main, only if tests passed ----------------
+  deploy:
+    name: Deploy to AWS
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # needed for OIDC sign-in to AWS
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # Personal AWS account: sign in with OIDC (no stored keys). Set the variable AWS_ROLE_ARN.
+      - name: Configure AWS credentials (own account, OIDC)
+        if: vars.AWS_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # AWS Academy Learner Lab: session keys stored as secrets.
+      - name: Configure AWS credentials (Learner Lab session keys)
+        if: vars.AWS_ROLE_ARN == ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create artifact bucket if missing
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          echo "ARTIFACT_BUCKET=${PROJECT}-artifacts-${ACCOUNT}" >> $GITHUB_ENV
+          aws s3api head-bucket --bucket ${PROJECT}-artifacts-${ACCOUNT} 2>/dev/null \
+            || aws s3 mb s3://${PROJECT}-artifacts-${ACCOUNT} --region $AWS_REGION
+
+      - name: Deploy servers stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name ${PROJECT}-servers \
+            --template-file infra/servers.yaml \
+            --parameter-overrides \
+                ChaosTest=${{ vars.CHAOS_TEST || 'false' }} \
+                InstanceProfileName=${{ vars.INSTANCE_PROFILE || 'LabInstanceProfile' }} \
+            --no-fail-on-empty-changeset
+
+      - name: Package Lambda code
+        if: vars.DEPLOY_AUTOMATION == 'true'
+        run: |
+          aws cloudformation package \
+            --template-file infra/automation.yaml \
+            --s3-bucket $ARTIFACT_BUCKET \
+            --output-template-file packaged-automation.yaml
+
+      - name: Deploy automation stack
+        if: vars.DEPLOY_AUTOMATION == 'true'
+        run: |
+          aws cloudformation deploy \
+            --stack-name ${PROJECT}-automation \
+            --template-file packaged-automation.yaml \
+            --parameter-overrides \
+                AlertEmail=${{ vars.ALERT_EMAIL }} \
+                ScheduleState=${{ vars.SCHEDULE_STATE || 'DISABLED' }} \
+                LabRoleName=${{ vars.AUTOMATION_ROLE || 'LabRole' }} \
+            --no-fail-on-empty-changeset
+
+      - name: Smoke test the dashboard API
+        if: vars.DEPLOY_AUTOMATION == 'true'
+        run: |
+          URL=$(aws cloudformation describe-stacks --stack-name ${PROJECT}-automation \
+                --query "Stacks[0].Outputs[?OutputKey=='DashboardUrl'].OutputValue" --output text)
+          echo "Dashboard: $URL"
+          curl -sf "${URL}status" | python3 -m json.tool | head -20
+          echo "### Dashboard: $URL" >> $GITHUB_STEP_SUMMARY
