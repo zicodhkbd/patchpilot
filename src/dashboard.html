@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PatchPilot Dashboard</title>
+<style>
+  :root { --bg:#f5f7fa; --card:#fff; --ink:#1d2733; --muted:#5d6b7a; --line:#dde3ea;
+          --ok:#1f8a4c; --warn:#b26b00; --bad:#c0392b; --info:#2563a8; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: "Segoe UI", Arial, sans-serif; background:var(--bg); color:var(--ink); }
+  header { background:#16324f; color:#fff; padding:18px 24px; }
+  header h1 { margin:0; font-size:22px; }
+  header p { margin:4px 0 0; color:#c9d6e3; font-size:14px; }
+  main { max-width:1100px; margin:0 auto; padding:20px 16px; }
+  .tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; margin-bottom:20px; }
+  .tile { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }
+  .tile .n { font-size:28px; font-weight:600; }
+  .tile .l { color:var(--muted); font-size:13px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:20px; overflow-x:auto; }
+  h2 { font-size:16px; margin:0 0 12px; }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; }
+  .badge { padding:3px 8px; border-radius:10px; font-size:12px; font-weight:600; color:#fff; }
+  .PATCHED_HEALTHY { background:var(--ok); }
+  .ROLLED_BACK, .UNHEALTHY, .ROLLING_BACK { background:var(--bad); }
+  .PATCH_FAILED, .PATCH_FAILED_STATUS { background:var(--warn); }
+  .other { background:var(--info); }
+  footer { color:var(--muted); font-size:12px; text-align:center; padding-bottom:20px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>PatchPilot</h1>
+  <p>Automated patching with pre-patch backup, health check and rollback</p>
+</header>
+<main>
+  <div class="tiles">
+    <div class="tile"><div class="n" id="t-total">-</div><div class="l">Servers tracked</div></div>
+    <div class="tile"><div class="n" id="t-ok" style="color:var(--ok)">-</div><div class="l">Patched and healthy</div></div>
+    <div class="tile"><div class="n" id="t-rb" style="color:var(--bad)">-</div><div class="l">Rolled back</div></div>
+    <div class="tile"><div class="n" id="t-other" style="color:var(--info)">-</div><div class="l">In progress / other</div></div>
+  </div>
+  <section>
+    <h2>Current server status (latest run per server)</h2>
+    <table><thead><tr><th>Server</th><th>Instance</th><th>Status</th><th>Backup AMI</th><th>Replacement</th><th>Updated (UTC)</th></tr></thead>
+    <tbody id="servers"><tr><td colspan="6">Loading...</td></tr></tbody></table>
+  </section>
+  <section>
+    <h2>Recent activity</h2>
+    <table><thead><tr><th>Time (UTC)</th><th>Run</th><th>Server</th><th>Status</th><th>Detail</th></tr></thead>
+    <tbody id="recent"></tbody></table>
+  </section>
+</main>
+<footer id="foot">Refreshes every 15 seconds</footer>
+<script>
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const badge = s => {
+  const known = ["PATCHED_HEALTHY","ROLLED_BACK","UNHEALTHY","ROLLING_BACK","PATCH_FAILED"];
+  return `<span class="badge ${known.includes(s) ? s : "other"}">${esc(s)}</span>`;
+};
+async function load() {
+  try {
+    const r = await fetch("status");
+    const d = await r.json();
+    const s = d.servers || [];
+    document.getElementById("t-total").textContent = s.length;
+    const ok = s.filter(x => x.Status === "PATCHED_HEALTHY").length;
+    const rb = s.filter(x => x.Status === "ROLLED_BACK").length;
+    document.getElementById("t-ok").textContent = ok;
+    document.getElementById("t-rb").textContent = rb;
+    document.getElementById("t-other").textContent = s.length - ok - rb;
+    document.getElementById("servers").innerHTML = s.length ? s.map(x => `<tr>
+      <td>${esc(x.Name)}</td><td>${esc(x.InstanceId)}</td><td>${badge(x.Status)}</td>
+      <td>${esc(x.BackupAmiId)}</td><td>${esc(x.ReplacementInstanceId)}</td><td>${esc(x.UpdatedAt)}</td></tr>`).join("")
+      : `<tr><td colspan="6">No patch runs yet. Start the state machine to begin.</td></tr>`;
+    document.getElementById("recent").innerHTML = (d.recent || []).map(x => `<tr>
+      <td>${esc(x.UpdatedAt)}</td><td>${esc(x.RunId)}</td><td>${esc(x.Name)}</td>
+      <td>${badge(x.Status)}</td><td>${esc(x.Detail)}</td></tr>`).join("");
+    document.getElementById("foot").textContent = "Last refreshed " + d.generatedAt + " UTC - refreshes every 15 seconds";
+  } catch (e) {
+    document.getElementById("foot").textContent = "Could not load status: " + e;
+  }
+}
+load(); setInterval(load, 15000);
+</script>
+</body>
+</html>

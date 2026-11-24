@@ -1,0 +1,421 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  PatchPilot - Stack 2 (automation). Patch Manager baseline, Step Functions
+  patch workflow (backup -> patch -> health check -> rollback -> report),
+  Lambda functions, DynamoDB status table, SNS alerts, EventBridge schedule,
+  CloudWatch alarm and an API Gateway dashboard.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: patchpilot
+  PatchGroupName:
+    Type: String
+    Default: patchpilot-web
+  AlertEmail:
+    Type: String
+    Description: Email address that receives patch reports and alarms (confirm the SNS subscription email).
+  LabRoleName:
+    Type: String
+    Default: LabRole
+    Description: Existing IAM role used by Lambda, Step Functions and EventBridge (AWS Academy Learner Lab provides LabRole).
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 8 ? * SUN *)
+    Description: When the patch cycle runs automatically (UTC). Default is Sunday 08:00 UTC = 2:00 AM Saskatchewan time.
+  ScheduleState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+  AmiRetentionDays:
+    Type: Number
+    Default: 3
+
+Resources:
+  # ---------- Patch Manager ----------
+  PatchBaseline:
+    Type: AWS::SSM::PatchBaseline
+    Properties:
+      Name: !Sub "${ProjectName}-al2023-baseline"
+      Description: Approve security and bug-fix updates for Amazon Linux 2023 immediately.
+      OperatingSystem: AMAZON_LINUX_2023
+      ApprovalRules:
+        PatchRules:
+          - ApproveAfterDays: 0
+            PatchFilterGroup:
+              PatchFilters:
+                - Key: CLASSIFICATION
+                  Values: [Security, Bugfix]
+      PatchGroups: [!Ref PatchGroupName]
+
+  # ---------- Storage ----------
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-logs
+            Status: Enabled
+            ExpirationInDays: 14
+      Tags: [{ Key: Project, Value: !Ref ProjectName }]
+
+  StatusTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-status"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: InstanceId, AttributeType: S }
+        - { AttributeName: RunId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: InstanceId, KeyType: HASH }
+        - { AttributeName: RunId, KeyType: RANGE }
+      Tags: [{ Key: Project, Value: !Ref ProjectName }]
+
+  # ---------- Notifications ----------
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-alerts"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  # ---------- Lambda functions (one code package, several handlers) ----------
+  DiscoverFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-discover"
+      Runtime: python3.12
+      Handler: handlers.discover
+      Code: ../src
+      Timeout: 120
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}"
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          PATCH_GROUP: !Ref PatchGroupName
+          TABLE_NAME: !Ref StatusTable
+          TOPIC_ARN: !Ref AlertTopic
+          AMI_RETENTION_DAYS: !Ref AmiRetentionDays
+
+  BackupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-backup"
+      Runtime: python3.12
+      Handler: handlers.backup
+      Code: ../src
+      Timeout: 60
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}"
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          PATCH_GROUP: !Ref PatchGroupName
+          TABLE_NAME: !Ref StatusTable
+          TOPIC_ARN: !Ref AlertTopic
+          AMI_RETENTION_DAYS: !Ref AmiRetentionDays
+
+  CheckPatchFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-check-patch"
+      Runtime: python3.12
+      Handler: handlers.check_patch
+      Code: ../src
+      Timeout: 30
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}"
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          PATCH_GROUP: !Ref PatchGroupName
+          TABLE_NAME: !Ref StatusTable
+          TOPIC_ARN: !Ref AlertTopic
+          AMI_RETENTION_DAYS: !Ref AmiRetentionDays
+
+  HealthCheckFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-health-check"
+      Runtime: python3.12
+      Handler: handlers.health_check
+      Code: ../src
+      Timeout: 120
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}"
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          PATCH_GROUP: !Ref PatchGroupName
+          TABLE_NAME: !Ref StatusTable
+          TOPIC_ARN: !Ref AlertTopic
+          AMI_RETENTION_DAYS: !Ref AmiRetentionDays
+
+  RollbackFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-rollback"
+      Runtime: python3.12
+      Handler: handlers.rollback
+      Code: ../src
+      Timeout: 900
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}"
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          PATCH_GROUP: !Ref PatchGroupName
+          TABLE_NAME: !Ref StatusTable
+          TOPIC_ARN: !Ref AlertTopic
+          AMI_RETENTION_DAYS: !Ref AmiRetentionDays
+
+  ReportFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-report"
+      Runtime: python3.12
+      Handler: handlers.report
+      Code: ../src
+      Timeout: 30
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}"
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          PATCH_GROUP: !Ref PatchGroupName
+          TABLE_NAME: !Ref StatusTable
+          TOPIC_ARN: !Ref AlertTopic
+          AMI_RETENTION_DAYS: !Ref AmiRetentionDays
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-api"
+      Runtime: python3.12
+      Handler: handlers.api
+      Code: ../src
+      Timeout: 15
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}"
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          PATCH_GROUP: !Ref PatchGroupName
+          TABLE_NAME: !Ref StatusTable
+          TOPIC_ARN: !Ref AlertTopic
+          AMI_RETENTION_DAYS: !Ref AmiRetentionDays
+
+  # ---------- Patch workflow (Step Functions) ----------
+  PatchStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${ProjectName}-patch-cycle"
+      RoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}"
+      DefinitionSubstitutions:
+        DiscoverArn: !GetAtt DiscoverFunction.Arn
+        BackupArn: !GetAtt BackupFunction.Arn
+        CheckPatchArn: !GetAtt CheckPatchFunction.Arn
+        HealthCheckArn: !GetAtt HealthCheckFunction.Arn
+        RollbackArn: !GetAtt RollbackFunction.Arn
+        ReportArn: !GetAtt ReportFunction.Arn
+        LogsBucket: !Ref LogsBucket
+      Definition:
+        Comment: PatchPilot rolling patch cycle - one server at a time
+        StartAt: Discover
+        States:
+          Discover:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${DiscoverArn}
+              Payload:
+                runId.$: $$.Execution.Name
+            OutputPath: $.Payload
+            Next: PatchEachServer
+          PatchEachServer:
+            Type: Map
+            ItemsPath: $.instances
+            MaxConcurrency: 1
+            ResultPath: $.results
+            Next: Report
+            ItemProcessor:
+              ProcessorConfig: { Mode: INLINE }
+              StartAt: Backup
+              States:
+                Backup:
+                  Type: Task
+                  Resource: arn:aws:states:::lambda:invoke
+                  Parameters: { FunctionName: "${BackupArn}", Payload.$: "$" }
+                  OutputPath: $.Payload
+                  Retry:
+                    - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException]
+                      IntervalSeconds: 5
+                      MaxAttempts: 3
+                      BackoffRate: 2
+                  Catch:
+                    - { ErrorEquals: [States.ALL], ResultPath: $.error, Next: MarkFailed }
+                  Next: SendPatchCommand
+                SendPatchCommand:
+                  Type: Task
+                  Resource: arn:aws:states:::aws-sdk:ssm:sendCommand
+                  Parameters:
+                    DocumentName: AWS-RunPatchBaseline
+                    InstanceIds.$: States.Array($.instanceId)
+                    Parameters:
+                      Operation: [Install]
+                      RebootOption: [RebootIfNeeded]
+                    OutputS3BucketName: ${LogsBucket}
+                    OutputS3KeyPrefix: patch-logs/
+                    TimeoutSeconds: 600
+                    Comment: PatchPilot patch cycle
+                  ResultSelector:
+                    commandId.$: $.Command.CommandId
+                  ResultPath: $.patch
+                  Catch:
+                    - { ErrorEquals: [States.ALL], ResultPath: $.error, Next: MarkFailed }
+                  Next: WaitForPatch
+                WaitForPatch:
+                  Type: Wait
+                  Seconds: 30
+                  Next: CheckPatch
+                CheckPatch:
+                  Type: Task
+                  Resource: arn:aws:states:::lambda:invoke
+                  Parameters: { FunctionName: "${CheckPatchArn}", Payload.$: "$" }
+                  OutputPath: $.Payload
+                  Catch:
+                    - { ErrorEquals: [States.ALL], ResultPath: $.error, Next: MarkFailed }
+                  Next: PatchFinished
+                PatchFinished:
+                  Type: Choice
+                  Choices:
+                    - { Variable: $.patchStatus, StringEquals: IN_PROGRESS, Next: WaitForPatch }
+                  Default: FaultInjectionEnabled
+                FaultInjectionEnabled:
+                  Type: Choice
+                  Comment: Test-only path that simulates a bad patch on servers tagged ChaosTest=true
+                  Choices:
+                    - { Variable: $.chaos, StringEquals: "true", Next: InjectFault }
+                  Default: HealthCheck
+                InjectFault:
+                  Type: Task
+                  Resource: arn:aws:states:::aws-sdk:ssm:sendCommand
+                  Parameters:
+                    DocumentName: AWS-RunShellScript
+                    InstanceIds.$: States.Array($.instanceId)
+                    Parameters:
+                      commands: ["systemctl stop nginx"]
+                    Comment: PatchPilot fault injection (simulated bad patch)
+                  ResultPath: null
+                  Next: WaitAfterFault
+                WaitAfterFault:
+                  Type: Wait
+                  Seconds: 20
+                  Next: HealthCheck
+                HealthCheck:
+                  Type: Task
+                  Resource: arn:aws:states:::lambda:invoke
+                  Parameters: { FunctionName: "${HealthCheckArn}", Payload.$: "$" }
+                  OutputPath: $.Payload
+                  Catch:
+                    - { ErrorEquals: [States.ALL], ResultPath: $.error, Next: MarkFailed }
+                  Next: IsHealthy
+                IsHealthy:
+                  Type: Choice
+                  Choices:
+                    - { Variable: $.healthy, BooleanEquals: true, Next: ServerDone }
+                  Default: Rollback
+                Rollback:
+                  Type: Task
+                  Resource: arn:aws:states:::lambda:invoke
+                  Parameters: { FunctionName: "${RollbackArn}", Payload.$: "$" }
+                  OutputPath: $.Payload
+                  Retry:
+                    - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException]
+                      IntervalSeconds: 5
+                      MaxAttempts: 3
+                      BackoffRate: 2
+                  Catch:
+                    - { ErrorEquals: [States.ALL], ResultPath: $.error, Next: MarkFailed }
+                  Next: ServerDone
+                MarkFailed:
+                  Type: Pass
+                  Parameters:
+                    instanceId.$: $.instanceId
+                    name.$: $.name
+                    runId.$: $.runId
+                    outcome: FAILED
+                    detail.$: $.error.Cause
+                  End: true
+                ServerDone:
+                  Type: Succeed
+          Report:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${ReportArn}
+              Payload:
+                runId.$: $.runId
+                results.$: $.results
+            OutputPath: $.Payload
+            End: true
+
+  # ---------- Schedule (EventBridge) ----------
+  PatchSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-weekly-patch"
+      Description: Start the PatchPilot patch cycle on a schedule
+      ScheduleExpression: !Ref ScheduleExpression
+      State: !Ref ScheduleState
+      Targets:
+        - Id: patch-cycle
+          Arn: !Ref PatchStateMachine
+          RoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}"
+
+  # ---------- Monitoring (CloudWatch) ----------
+  WorkflowFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-patch-cycle-failed"
+      AlarmDescription: The PatchPilot state machine execution failed
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - { Name: StateMachineArn, Value: !Ref PatchStateMachine }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  # ---------- Dashboard (API Gateway HTTP API -> Lambda) ----------
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${ProjectName}-dashboard"
+      ProtocolType: HTTP
+      Target: !GetAtt ApiFunction.Arn
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*"
+
+Outputs:
+  DashboardUrl:
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/"
+  StateMachineArn:
+    Value: !Ref PatchStateMachine
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+  StatusTableName:
+    Value: !Ref StatusTable
+  PatchLogsBucket:
+    Value: !Ref LogsBucket

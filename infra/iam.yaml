@@ -1,0 +1,164 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  PatchPilot - Stack 0 (IAM) for a personal AWS account. Creates the roles that
+  AWS Academy Learner Lab normally provides (LabRole, LabInstanceProfile) plus a
+  GitHub OIDC role so GitHub Actions can deploy without long-lived access keys.
+  Deploy this stack once by hand from the CloudFormation console.
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Description: Your GitHub user name (the owner of the patchpilot repository).
+  GitHubRepo:
+    Type: String
+    Default: patchpilot
+  CreateOIDCProvider:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Choose "false" only if this AWS account already has the token.actions.githubusercontent.com identity provider.
+
+Conditions:
+  MakeProvider: !Equals [!Ref CreateOIDCProvider, "true"]
+
+Resources:
+  # ---------- Role for the EC2 web servers (replaces LabInstanceProfile) ----------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: PatchPilotInstanceRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: write-patch-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetEncryptionConfiguration]
+                Resource:
+                  - arn:aws:s3:::patchpilot-automation-logsbucket-*
+                  - arn:aws:s3:::patchpilot-automation-logsbucket-*/*
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: PatchPilotInstanceProfile
+      Roles: [!Ref InstanceRole]
+
+  # ---------- Role for Lambda, Step Functions and EventBridge (replaces LabRole) ----------
+  AutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: PatchPilotAutomationRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com, states.amazonaws.com, events.amazonaws.com]
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: patchpilot-automation
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Ec2BackupPatchRollback
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeImages
+                  - ec2:CreateImage
+                  - ec2:DeregisterImage
+                  - ec2:DeleteSnapshot
+                  - ec2:DescribeSnapshots
+                  - ec2:RunInstances
+                  - ec2:StopInstances
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                Resource: "*"
+              - Sid: PassInstanceRoleToReplacementServer
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt InstanceRole.Arn
+              - Sid: SystemsManager
+                Effect: Allow
+                Action: [ssm:SendCommand, ssm:GetCommandInvocation, ssm:ListCommandInvocations]
+                Resource: "*"
+              - Sid: StatusTable
+                Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:Query, dynamodb:Scan]
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/patchpilot-status"
+              - Sid: Reports
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:patchpilot-alerts"
+              - Sid: StepFunctionsCallsLambda
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:patchpilot-*"
+              - Sid: EventBridgeStartsWorkflow
+                Effect: Allow
+                Action: states:StartExecution
+                Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:patchpilot-*"
+
+  # ---------- GitHub Actions sign-in without access keys (OIDC) ----------
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: MakeProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      ThumbprintList: [6938fd4d98bab03faadb97b34396831e3780aea1]
+
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: PatchPilotGitHubDeployRole
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOwner}/${GitHubRepo}:ref:refs/heads/main"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/PowerUserAccess
+      Policies:
+        - PolicyName: pass-patchpilot-roles
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [iam:PassRole, iam:GetRole]
+                Resource:
+                  - !GetAtt InstanceRole.Arn
+                  - !GetAtt AutomationRole.Arn
+              - Effect: Allow
+                Action: [iam:GetInstanceProfile]
+                Resource: !GetAtt InstanceProfile.Arn
+
+Outputs:
+  GitHubDeployRoleArn:
+    Description: Put this value in the GitHub variable AWS_ROLE_ARN
+    Value: !GetAtt GitHubDeployRole.Arn
+  InstanceProfileName:
+    Description: Put this value in the GitHub variable INSTANCE_PROFILE
+    Value: !Ref InstanceProfile
+  AutomationRoleName:
+    Description: Put this value in the GitHub variable AUTOMATION_ROLE
+    Value: !Ref AutomationRole

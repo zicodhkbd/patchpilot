@@ -1,0 +1,183 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  PatchPilot - Stack 1 (servers). VPC with two public subnets in two AZs,
+  a web security group and a small fleet of Amazon Linux 2023 web servers
+  managed by AWS Systems Manager (no SSH keys needed).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: patchpilot
+  PatchGroupName:
+    Type: String
+    Default: patchpilot-web
+    Description: Value of the PatchGroup tag that the automation targets.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t2.micro, t3.micro, t3.small]
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+    Description: Latest Amazon Linux 2023 AMI (resolved from SSM Parameter Store).
+  ChaosTest:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Set to "true" to simulate a bad patch on web-3 (fault-injection test of the rollback).
+  InstanceProfileName:
+    Type: String
+    Default: LabInstanceProfile
+    Description: Existing instance profile (AWS Academy Learner Lab provides LabInstanceProfile).
+
+Resources:
+  # ---------- Network ----------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-vpc" }, { Key: Project, Value: !Ref ProjectName }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-igw" }]
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-public-a" }]
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-public-b" }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-public-rt" }]
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  SubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTP for the web page and the /health check. No SSH - Session Manager is used instead.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-web-sg" }]
+
+  # ---------- Servers ----------
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ProjectName}-web-lt"
+      LaunchTemplateData:
+        ImageId: !Ref ImageId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Name: !Ref InstanceProfileName }
+        SecurityGroupIds: [!Ref WebSecurityGroup]
+        MetadataOptions:
+          HttpTokens: required
+          InstanceMetadataTags: enabled
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            dnf install -y nginx
+            TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+            IID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+            NAME=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/tags/instance/Name)
+            cat > /usr/share/nginx/html/index.html <<EOF
+            <html><body style="font-family:sans-serif">
+            <h1>PatchPilot demo server: $NAME</h1><p>Instance: $IID</p>
+            <p>Patched automatically by PatchPilot.</p></body></html>
+            EOF
+            echo "OK" > /usr/share/nginx/html/health
+            systemctl enable --now nginx
+            systemctl enable --now amazon-ssm-agent
+
+  WebServer1:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate: { LaunchTemplateId: !Ref WebLaunchTemplate, Version: !GetAtt WebLaunchTemplate.LatestVersionNumber }
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-web-1" }
+        - { Key: PatchGroup, Value: !Ref PatchGroupName }
+        - { Key: Project, Value: !Ref ProjectName }
+
+  WebServer2:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate: { LaunchTemplateId: !Ref WebLaunchTemplate, Version: !GetAtt WebLaunchTemplate.LatestVersionNumber }
+      SubnetId: !Ref PublicSubnetB
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-web-2" }
+        - { Key: PatchGroup, Value: !Ref PatchGroupName }
+        - { Key: Project, Value: !Ref ProjectName }
+
+  WebServer3:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate: { LaunchTemplateId: !Ref WebLaunchTemplate, Version: !GetAtt WebLaunchTemplate.LatestVersionNumber }
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-web-3" }
+        - { Key: PatchGroup, Value: !Ref PatchGroupName }
+        - { Key: Project, Value: !Ref ProjectName }
+        # Fault-injection test target: PatchPilot simulates a bad patch on this server
+        # (stops nginx after patching) so the health check fails and rollback runs.
+        - { Key: ChaosTest, Value: !Ref ChaosTest }
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+  WebServer1Url:
+    Value: !Sub "http://${WebServer1.PublicIp}"
+  WebServer2Url:
+    Value: !Sub "http://${WebServer2.PublicIp}"
+  WebServer3Url:
+    Value: !Sub "http://${WebServer3.PublicIp}"
+  PatchGroupName:
+    Value: !Ref PatchGroupName
+    Export: { Name: !Sub "${ProjectName}-PatchGroup" }
