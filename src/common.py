@@ -10,7 +10,7 @@ PROJECT = os.environ.get("PROJECT_NAME", "patchpilot")
 
 # SSM command statuses -> what the state machine should do next
 _IN_PROGRESS = {"Pending", "InProgress", "Delayed"}
-_SUCCESS = {"Success"}
+_SUCCESS = {"Done"}
 
 
 def now_iso():
