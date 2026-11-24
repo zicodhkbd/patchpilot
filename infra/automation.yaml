@@ -307,7 +307,7 @@ Resources:
                     Parameters:
                       commands: ["systemctl stop nginx"]
                     Comment: PatchPilot fault injection (simulated bad patch)
-                  ResultPath: null
+                  ResultPath: $.faultResult
                   Next: WaitAfterFault
                 WaitAfterFault:
                   Type: Wait
